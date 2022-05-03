@@ -1,0 +1,196 @@
+# PHP CircleCI 2.1 configuration file
+#
+# Check https://circleci.com/docs/2.0/language-php/ for more details
+#
+version: 2.1
+orbs:
+  slack: circleci/slack@4.5.0
+jobs:
+  tests:
+    docker:
+      # specify the version you desire here
+      - image: circleci/php:7.4.10-node-browsers
+
+      # Specify service dependencies here if necessary
+      # CircleCI maintains a library of pre-built images
+      # documented at https://circleci.com/docs/2.0/circleci-images/
+      # - image: circleci/mysql:9.4
+
+    resource_class: large
+
+    working_directory: ~/repo
+
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: sudo apt-get update --allow-releaseinfo-change
+      - run: sudo apt install -y libsqlite3-dev
+      - run: sudo docker-php-ext-install bcmath
+      - run: sudo docker-php-ext-install exif
+      - run: sudo composer self-update
+
+      # Download and cache dependencies
+      - restore_cache:
+          keys:
+          - v1-dependencies-{{ checksum "composer.lock" }}
+          # fallback to using the latest cache if no exact match is found
+          - v1-dependencies-
+
+      - run: composer install -n --prefer-dist
+
+      - save_cache:
+          paths:
+            - ./vendor
+          key: v1-dependencies-{{ checksum "composer.lock" }}
+
+      # Set up dgraph
+      - run: cd dgraph && echo 'DGRAPH_AUTH_TOKEN=circlecidgraphauthtoken' > .env; docker-compose up -d
+
+
+      # Set up port forwarding from dgraph server
+      - run: sudo apt-get -y update; sleep 1; sudo apt-get -y install socat
+      - run: docker --tlsverify -H=$DOCKER_HOST --tlscacert=$DOCKER_CERT_PATH/ca.pem --tlscert=$DOCKER_CERT_PATH/cert.pem --tlskey=$DOCKER_CERT_PATH/key.pem exec dgraph_server_1 apt-get -y update
+      - run: docker --tlsverify -H=$DOCKER_HOST --tlscacert=$DOCKER_CERT_PATH/ca.pem --tlscert=$DOCKER_CERT_PATH/cert.pem --tlskey=$DOCKER_CERT_PATH/key.pem exec dgraph_server_1 apt-get -y install socat
+      - run: sleep 5
+      - run:
+          name: dgraph tunnel
+          background: true
+          command: socat TCP-LISTEN:8080,reuseaddr,fork "EXEC:'docker --tlsverify -H=$DOCKER_HOST --tlscacert=$DOCKER_CERT_PATH/ca.pem --tlscert=$DOCKER_CERT_PATH/cert.pem --tlskey=$DOCKER_CERT_PATH/key.pem exec -i dgraph_server_1 socat STDIO TCP-CONNECT:localhost:8080'"
+
+      # Copy .env file
+      - run: cp .env.example .env
+
+      # Install key
+      - run: php artisan key:generate
+
+      # Install node dependencies
+      - run: curl -o- -L https://yarnpkg.com/install.sh | bash
+
+      - restore_cache:
+          keys:
+            - v1-node-dependencies-{{ checksum "yarn.lock" }}
+            - v1-node-dependencies-
+
+      - run: yarn install
+
+      - save_cache:
+          paths:
+            - ./node_modules
+          key: v1-node-dependencies-{{ checksum "yarn.lock" }}
+
+      - run: yarn run prod
+
+      # run tests!
+      - run:
+          name: "Setup custom environment variables"
+          command: |
+            echo 'export OVERWRITE_DGRAPH_URL="http://localhost"' >> $BASH_ENV; echo 'export OVERWRITE_DGRAPH_PORT="8080"' >> $BASH_ENV; echo 'export OVERWRITE_DGRAPH_AUTH_TOKEN=circlecidgraphauthtoken' >> $BASH_ENV
+
+      - run: phpdbg -qrr ./vendor/bin/phpunit --coverage-html build/coverage-report --configuration phpunit-ci.xml -d memory_limit=8000M
+
+      - store_artifacts:
+          path:  build/coverage-report
+
+      - run: ./vendor/bin/phpcs --standard=od-cs-ruleset.xml app/ --ignore=*/migrations/*,*/tests/*
+
+      - run:
+          name: Output logs on failure
+          command: cat ./storage/logs/*
+          when: on_fail
+
+      - slack/notify:
+          event: fail
+          template: basic_fail_1
+
+      - slack/notify:
+          event: pass
+          template: basic_success_1
+
+  node_build:
+    docker:
+      - image: circleci/php:7.4.10-node-browsers
+
+    working_directory: ~/rep
+
+    steps:
+      - checkout
+      - run: curl -o- -L https://yarnpkg.com/install.sh | bash
+
+      - restore_cache:
+          keys:
+            - v1-node-dependencies-{{ checksum "yarn.lock" }}
+            - v1-node-dependencies-
+
+      - run: yarn install
+
+      - save_cache:
+          paths:
+            - ./node_modules
+          key: v1-node-dependencies-{{ checksum "yarn.lock" }}
+
+      - run: yarn run prod
+
+      - restore_cache:
+          keys:
+            - v1-dependencies-{{ checksum "composer.lock" }}
+            # fallback to using the latest cache if no exact match is found
+            - v1-dependencies-
+
+      - run: composer install -n --prefer-dist
+
+      - save_cache:
+          paths:
+            - ./vendor
+          key: v1-dependencies-{{ checksum "composer.lock" }}
+
+      - slack/notify:
+          event: fail
+          template: basic_fail_1
+
+      - slack/notify:
+          event: pass
+          template: basic_success_1
+
+  docker_build:
+    docker:
+      - image: circleci/php:7.4.10-node-browsers
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 19.03.14
+
+      - run: |
+          if [ "${DOCKER_BUILD}" = "true" ]; then
+              echo "Building Docker Image"
+              bash docker/scripts/docker-build.sh
+          fi
+
+      - slack/notify:
+          event: fail
+          template: basic_fail_1
+
+      - slack/notify:
+          event: pass
+          template: basic_success_1
+
+  deploy:
+    docker:
+      - image: circleci/php:7.4.10-node-browsers
+    working_directory: ~/repo
+    steps:
+      - run: curl ${FORGE_URL}
+
+workflows:
+  version: 2
+  build_workflow:
+    jobs:
+      - tests:
+          context: "Slack Creds"
+      - node_build:
+          context: "Slack Creds"
+      - docker_build:
+          context: "Slack Creds"
+          requires:
+            - tests
+            - node_build

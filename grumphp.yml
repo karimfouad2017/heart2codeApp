@@ -1,0 +1,21 @@
+grumphp:
+  tasks:
+    phpcs:
+      standard: ['od-cs-ruleset.xml']
+      severity: ~
+      error_severity: ~
+      warning_severity: ~
+      tab_width: ~
+      report: full
+      report_width: ~
+      whitelist_patterns: []
+      encoding: ~
+      ignore_patterns:
+        - "*/migrations/*"
+        - "*/tests/*"
+        - '*.blade.php'
+        - 'index.php'
+        - 'database/seeds/'
+      sniffs: []
+      triggered_by: [php]
+      exclude: []
